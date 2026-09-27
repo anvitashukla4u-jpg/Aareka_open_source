@@ -5,31 +5,29 @@ Aareka  .  Sender agent   (customer side)
 Runs inside the customer's environment. On an interval it:
 
     1. reads this machine's power via the collector (imp_server_power_source),
-    2. reads the OWNERSHIP telemetry too - which process/workload is on which GPU
-       (nvidia-smi compute-apps, live) - so the AWS engine can attribute it,
+    2. reads OWNERSHIP telemetry - which workload/VM is on which GPU, including
+       VIRTUAL PARTITIONS (vGPU / MIG) via `nvidia-smi vgpu -q`, plus per-process
+       ownership via `nvidia-smi --query-compute-apps`,
     3. packages watts + ownership into the Ingest API's batch shape,
     4. POSTs it to your Ingest API, authenticated with the customer's org key.
 
-Read-only on the customer's systems. Outbound HTTPS only - it never opens a
-port. Standard library only (no pip install).
+Read-only. Outbound HTTPS only. Standard library only.
 
-What it sends (the data contract):
-    (A) power     node_total_w, gpus[] (watts + mode + owner/shares), cpu_readings[]
-    (B) topology  workloads[] (which workload, which GPU it's on)   <- live via nvidia-smi
-    (C) tags      department per workload, from AAREKA_DEPT_MAP      <- optional mapping
-
-Bare-metal / single-node works live today via nvidia-smi. Pulling rich topology
-(cpu shares, tags) from Kubernetes / vCenter uses imp_topology / vcenter_connector,
-whose live reads are still stubbed against mocks - that's the remaining integration.
+Ownership sources (in priority order, per GPU):
+    * vGPU / MIG slices  -> `nvidia-smi vgpu -q` (a vGPU/MIG-configured host).
+                           mode = vgpu (or mig via AAREKA_GPU_MODE); split by FB.
+    * per-process        -> `nvidia-smi --query-compute-apps` (bare metal).
+                           1 process = passthrough (exact); 2+ = shared (estimated).
 
 Config (environment variables, or the matching --flags):
-    AAREKA_INGEST_URL   your Ingest API base URL                                (required)
-    AAREKA_ORG_KEY      the customer's secret key                               (required)
+    AAREKA_INGEST_URL   your Ingest API base URL                     (required)
+    AAREKA_ORG_KEY      the customer's secret key                    (required)
     AAREKA_INTERVAL     seconds between sends (default 60)
     AAREKA_HOST         host label (default: hostname)
-    AAREKA_DEPT_MAP     JSON {workload_name: department} to tag ownership (optional)
-    # optional telemetry endpoints handed to the collector:
-    AAREKA_PROM_URL / AAREKA_BMC / AAREKA_IPMI / AAREKA_PDU
+    AAREKA_DEPT_MAP     JSON {workload_or_vm_name: department}        (optional tags)
+    AAREKA_GPU_MODE     "vgpu" (default) or "mig" - label for read partitions
+    AAREKA_VGPU_QFILE   path to a saved `nvidia-smi vgpu -q` dump (testing/injection)
+    AAREKA_PROM_URL / AAREKA_BMC / AAREKA_IPMI / AAREKA_PDU          (telemetry endpoints)
 
 Run:
     python aareka_sender.py            # loop forever
@@ -41,6 +39,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -51,20 +50,19 @@ from datetime import datetime, timezone
 
 import imp_server_power_source as sps
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 
 
 def _iso_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-# ------------------------------------------------------- ownership telemetry
+# ------------------------------------------------------- nvidia-smi helpers
 def _nvidia_smi(query: str) -> list[list[str]]:
-    """Run a read-only nvidia-smi CSV query -> list of split rows. [] on failure."""
+    """Read-only nvidia-smi CSV query -> list of split rows. [] on failure."""
     try:
-        out = subprocess.run(
-            ["nvidia-smi", query, "--format=csv,noheader,nounits"],
-            capture_output=True, text=True, timeout=5)
+        out = subprocess.run(["nvidia-smi", query, "--format=csv,noheader,nounits"],
+                             capture_output=True, text=True, timeout=5)
     except (subprocess.SubprocessError, OSError):
         return []
     if out.returncode != 0:
@@ -73,35 +71,108 @@ def _nvidia_smi(query: str) -> list[list[str]]:
             for line in out.stdout.strip().splitlines() if line.strip()]
 
 
+def _run_raw(args: list[str]) -> "str | None":
+    """Run a read-only nvidia-smi command, return raw stdout (or None)."""
+    try:
+        out = subprocess.run(["nvidia-smi", *args], capture_output=True, text=True, timeout=5)
+    except (subprocess.SubprocessError, OSError):
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
 def gpu_processes_by_index() -> dict:
-    """{gpu_index: [{name, mem_mb}]} - which processes run on which GPU, live."""
-    # map GPU uuid -> index
+    """{gpu_index: [{name, mem_mb}]} - processes per GPU (bare-metal ownership)."""
     uuid_to_idx = {}
     for row in _nvidia_smi("--query-gpu=index,uuid"):
         if len(row) >= 2:
             uuid_to_idx[row[1]] = row[0]
-    # per-process: pid, name, gpu uuid, used memory
     out: dict = {}
     for row in _nvidia_smi(
             "--query-compute-apps=pid,process_name,gpu_uuid,used_gpu_memory"):
         if len(row) < 4:
             continue
-        _pid, name, uuid, mem = row[0], row[1], row[2], row[3]
-        idx = uuid_to_idx.get(uuid, uuid)
+        name, uuid, mem = row[1], row[2], row[3]
         try:
             mem_mb = float(mem)
         except ValueError:
             mem_mb = 0.0
-        # trim a full path down to the program name for a readable workload id
         short = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] or name
-        out.setdefault(idx, []).append({"name": short, "mem_mb": mem_mb})
+        out.setdefault(uuid_to_idx.get(uuid, uuid), []).append({"name": short, "mem_mb": mem_mb})
     return out
+
+
+# ------------------------------------------------------- virtual partitions (vGPU / MIG)
+# Ported from gpu_vm_collector.parse_vgpu_q so the sender reads the SAME partition
+# telemetry the engine expects. Reads `nvidia-smi vgpu -q` (a vGPU/MIG host).
+def _parse_vgpu_q(text: str, bus_to_index: "dict | None" = None) -> list[dict]:
+    bus_to_index = bus_to_index or {}
+    recs: list[dict] = []
+    gpu_bus = None
+    cur: "dict | None" = None
+    in_util = in_fb = False
+    for raw in text.splitlines():
+        s = raw.strip()
+        if s.startswith("GPU ") and ":" in s:
+            gpu_bus = s.split(None, 1)[1].strip()
+            continue
+        if s.startswith("vGPU ID"):
+            if cur:
+                recs.append(cur)
+            cur = {"gpu": bus_to_index.get(gpu_bus, gpu_bus), "vm": None,
+                   "util": 0.0, "fb_mb": 0.0}
+            in_util = in_fb = False
+            continue
+        if cur is None:
+            continue
+        if s.startswith("VM Name"):
+            cur["vm"] = s.split(":", 1)[1].strip()
+        elif s.startswith("FB Memory Usage"):
+            in_fb, in_util = True, False
+        elif s.startswith("Utilization"):
+            in_util, in_fb = True, False
+        elif in_fb and s.startswith("Total"):
+            m = re.search(r"(\d+)", s)
+            if m:
+                cur["fb_mb"] = float(m.group(1))
+            in_fb = False
+        elif in_util and s.startswith("Gpu"):
+            m = re.search(r"(\d+)", s)
+            if m:
+                cur["util"] = float(m.group(1))
+            in_util = False
+    if cur:
+        recs.append(cur)
+    return [r for r in recs if r.get("vm")]
+
+
+def _bus_to_index() -> dict:
+    """Map PCI bus id -> GPU index, so vGPU slices line up with power readings."""
+    m = {}
+    for row in _nvidia_smi("--query-gpu=index,pci.bus_id"):
+        if len(row) >= 2:
+            m[row[1]] = row[0]
+    return m
+
+
+def read_vgpu_instances() -> list[dict]:
+    """vGPU/MIG slices this host exposes: [{gpu, vm, util, fb_mb}]. Reads
+    `nvidia-smi vgpu -q`, or a saved dump named by AAREKA_VGPU_QFILE (testing).
+    Empty on a host without vGPU/MIG."""
+    b2i = _bus_to_index()
+    qfile = os.environ.get("AAREKA_VGPU_QFILE")
+    if qfile and os.path.exists(qfile):
+        with open(qfile) as f:
+            return _parse_vgpu_q(f.read(), b2i)
+    out = _run_raw(["vgpu", "-q"])
+    if out:
+        return _parse_vgpu_q(out, b2i)
+    return []
 
 
 # ------------------------------------------------------- batch builders
 def build_full_batch(sp: "sps.ServerPower", host: str, dept_map: dict):
-    """Watts + live GPU ownership -> the full contract. None if no GPU telemetry
-    (caller then falls back to the flat, watts-only batch)."""
+    """Watts + ownership (virtual partitions first, then per-process) -> full
+    contract. None if there's no GPU telemetry (caller falls back to flat)."""
     gpu_readings = [r for r in sp.readings if r.scope in ("gpu", "gpu(detail)")]
     cpu_readings = [r for r in sp.readings if r.scope in ("cpu", "dram")]
     node_reading = next((r for r in sp.readings if r.scope in ("node", "rack")), None)
@@ -109,42 +180,60 @@ def build_full_batch(sp: "sps.ServerPower", host: str, dept_map: dict):
         return None
 
     procs_by_idx = gpu_processes_by_index()
-    gpus, workloads = [], {}
+    vgpu_by_idx: dict = {}
+    for inst in read_vgpu_instances():
+        vgpu_by_idx.setdefault(str(inst["gpu"]), []).append(inst)
+    part_mode = os.environ.get("AAREKA_GPU_MODE", "vgpu").lower()
+    if part_mode not in ("vgpu", "mig"):
+        part_mode = "vgpu"
 
+    gpus, workloads = [], {}
     for r in gpu_readings:
-        idx = r.entity_id.replace("gpu", "").split("(")[0]     # "gpu0" -> "0"
+        idx = r.entity_id.replace("gpu", "").split("(")[0]
         watts = round(r.watts, 2)
+        slices = vgpu_by_idx.get(idx, [])
+
+        if slices:
+            # VIRTUAL PARTITIONS (vGPU / MIG): send each VM's allocation (frame-buffer
+            # share) AND utilisation, so the engine's baseline(alloc)+dynamic(util)
+            # split uses both. Attribution = estimated (per the engine).
+            total_fb = sum(s.get("fb_mb", 0.0) for s in slices) or 1e-9
+            vgpu_vms: dict = {}
+            for s in slices:
+                vm = s["vm"]
+                e = vgpu_vms.setdefault(vm, {"alloc": 0.0, "util": 0.0})
+                e["alloc"] = round(e["alloc"] + s.get("fb_mb", 0.0) / total_fb, 3)
+                e["util"] = max(e["util"], s.get("util", 0.0))
+                w = workloads.setdefault(vm, {"gpu_ids": set(), "kind": "vm"})
+                w["gpu_ids"].add(r.entity_id)
+            gpus.append({"gpu_id": r.entity_id, "watts": watts, "method": r.method.value,
+                         "mode": part_mode, "vgpu_vms": vgpu_vms})
+            continue
+
         procs = procs_by_idx.get(idx, [])
-        # aggregate processes on this card by program name (same app = one workload)
         by_name: dict = {}
         for p in procs:
             by_name[p["name"]] = by_name.get(p["name"], 0.0) + p["mem_mb"]
-
         if not by_name:
-            # powered GPU with no compute process -> nobody owns it (honest residual)
-            gpus.append({"gpu_id": r.entity_id, "watts": watts,
-                         "method": r.method.value, "mode": "passthrough", "owner": None})
+            gpus.append({"gpu_id": r.entity_id, "watts": watts, "method": r.method.value,
+                         "mode": "passthrough", "owner": None})
             continue
-        if len(by_name) == 1:                                  # sole tenant -> exact
+        if len(by_name) == 1:
             name = next(iter(by_name))
-            gpus.append({"gpu_id": r.entity_id, "watts": watts,
-                         "method": r.method.value, "mode": "passthrough", "owner": name})
-        else:                                                  # shared -> split by mem
+            gpus.append({"gpu_id": r.entity_id, "watts": watts, "method": r.method.value,
+                         "mode": "passthrough", "owner": name})
+        else:
             total = sum(by_name.values()) or 1e-9
-            shares = {n: round(m / total, 3) for n, m in by_name.items()}
-            gpus.append({"gpu_id": r.entity_id, "watts": watts,
-                         "method": r.method.value, "mode": "vgpu", "shares": shares})
+            gpus.append({"gpu_id": r.entity_id, "watts": watts, "method": r.method.value,
+                         "mode": "vgpu",
+                         "shares": {n: round(m / total, 3) for n, m in by_name.items()}})
         for n in by_name:
-            w = workloads.setdefault(n, {"gpu_ids": set()})
+            w = workloads.setdefault(n, {"gpu_ids": set(), "kind": "process"})
             w["gpu_ids"].add(r.entity_id)
 
-    workload_list = [{
-        "id": n, "kind": "process",
-        "cpu_share": 0.0,          # bare metal: no per-process CPU share without an
-        "mem_mb": 0.0,             #   orchestrator, so CPU stays node overhead (honest)
-        "gpu_ids": sorted(v["gpu_ids"]),
-        "department": dept_map.get(n),   # None -> shown as "unmapped"
-    } for n, v in workloads.items()]
+    workload_list = [{"id": n, "kind": v.get("kind", "process"), "cpu_share": 0.0,
+                      "mem_mb": 0.0, "gpu_ids": sorted(v["gpu_ids"]),
+                      "department": dept_map.get(n)} for n, v in workloads.items()]
 
     batch = {
         "host": host, "captured_at": _iso_now(), "collector_version": VERSION,
@@ -161,7 +250,7 @@ def build_full_batch(sp: "sps.ServerPower", host: str, dept_map: dict):
 
 
 def build_flat_batch(sp: "sps.ServerPower", host: str) -> dict:
-    """Fallback: watts only (no ownership). The engine stores it but can't attribute."""
+    """Fallback: watts only (no ownership). Stored but not attributed."""
     return {
         "host": host, "captured_at": _iso_now(), "collector_version": VERSION,
         "readings": [{"entity_id": r.entity_id, "scope": r.scope,
@@ -171,7 +260,6 @@ def build_flat_batch(sp: "sps.ServerPower", host: str) -> dict:
 
 
 def post_batch(base_url: str, key: str, batch: dict, timeout: float = 10.0):
-    """POST one batch to <base_url>/v1/ingest with the org key. Outbound only."""
     data = json.dumps(batch).encode("utf-8")
     req = urllib.request.Request(
         base_url.rstrip("/") + "/v1/ingest", data=data, method="POST",
@@ -181,19 +269,16 @@ def post_batch(base_url: str, key: str, batch: dict, timeout: float = 10.0):
 
 
 def run_once(cfg: dict) -> bool:
-    """Read this machine (watts + ownership), package, send one batch."""
     sp = sps.read_server_power(prom_url=cfg.get("prom"), bmc=cfg.get("bmc"),
                                ipmi=cfg.get("ipmi"), pdu=cfg.get("pdu"))
     if not sp.readings:
         print("  no readings from any source this cycle - nothing to send")
         return False
-
     batch = build_full_batch(sp, cfg["host"], cfg["dept_map"])
     shape = "full (watts + ownership)"
     if batch is None:
         batch = build_flat_batch(sp, cfg["host"])
         shape = "flat (watts only - no GPU ownership found)"
-
     try:
         status, body = post_batch(cfg["url"], cfg["key"], batch)
         print(f"  sent {shape} -> HTTP {status}: "
@@ -245,7 +330,6 @@ def main():
     ap.add_argument("--interval", type=int, help="seconds between sends")
     args = ap.parse_args()
     cfg = load_cfg(args)
-
     print(f"\n  Aareka sender  ->  {cfg['url']}   host={cfg['host']}")
     if args.once:
         run_once(cfg)
