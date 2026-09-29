@@ -17,33 +17,38 @@ does it for you.
 
 ---
 
-## Quickstart — send your data to the Aareka pilot
+## Quickstart — try Aareka on your own hardware
 
-*For design partners we've given a pilot **org key** and a **dashboard login**. The
-collector is read-only and makes outbound HTTPS calls only — it sends power readings
-and workload ownership, never commands, and nothing else leaves your machine.*
+Self-serve: you create your own private space, get a collector key, run the read-only
+collector on a GPU box, and watch your power get attributed. The collector makes
+outbound HTTPS calls only — it sends power readings and workload ownership, never
+commands, and nothing else leaves your machine.
 
-**1. Prerequisites** (details in [PREREQUISITES.md](PREREQUISITES.md))
+**1. Create your space and get your key.** Go to **aareka.aicontransformation.com**,
+click **Create account**, and sign up with your email and a password. Leave *team key*
+blank — that's only for joining an existing team. You'll be shown your **collector
+key**; copy it (you can find it again anytime on your dashboard).
+
+**2. Prerequisites** (details in [PREREQUISITES.md](PREREQUISITES.md))
 - **Python 3.9+** — the only hard requirement.
 - **GPU power:** the NVIDIA driver, so `nvidia-smi` works (gives *measured* GPU power).
 - **Best whole-machine accuracy (optional):** read-only BMC/IPMI/Redfish access.
 
-**2. Get the collector**
+**3. Get the collector**
 ```bash
 git clone https://github.com/anvitashukla4u-jpg/Aareka_open_source.git
 cd Aareka_open_source
 ```
 
-**3. Point it at the pilot.** The URL is fixed; the key was sent to you privately —
-keep it secret, don't commit it.
+**4. Point it at your space** (paste your key from step 1 — keep it private, don't commit it)
 ```bash
 export AAREKA_INGEST_URL="https://aareka.aicontransformation.com"
-export AAREKA_ORG_KEY="<the org key we emailed you>"
+export AAREKA_ORG_KEY="<your collector key from the dashboard>"
 # Optional: label who owns what. Maps a process name or VM name -> a department.
 export AAREKA_DEPT_MAP='{"training-job":"Research","inference-svc":"Platform"}'
 ```
 
-**4. Send one batch and read the receipt**
+**5. Send one batch and read the receipt**
 ```bash
 python aareka_sender.py --once
 ```
@@ -55,11 +60,9 @@ Expected output (numbers illustrative):
       Platform           59.5 W
 ```
 
-**5. See it on your dashboard.** Go to **aareka.aicontransformation.com**, click
-**Create account**, and register with your email, a password you choose, and the
-**same org key** from step 3. You land straight on your dashboard — workloads,
-departments, and measured-vs-estimated power. Your login only ever shows *your*
-organisation's data. (Next time, just **Sign in**.)
+**6. See it on your dashboard.** Refresh **aareka.aicontransformation.com** — your
+workloads, departments, and measured-vs-estimated power appear. Your login only ever
+shows your own space's data.
 
 **Keep it running** (send every 60 s instead of once):
 ```bash
