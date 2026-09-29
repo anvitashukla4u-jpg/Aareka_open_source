@@ -17,6 +17,67 @@ does it for you.
 
 ---
 
+## Quickstart — send your data to the Aareka pilot
+
+*For design partners we've given a pilot **org key** and a **dashboard login**. The
+collector is read-only and makes outbound HTTPS calls only — it sends power readings
+and workload ownership, never commands, and nothing else leaves your machine.*
+
+**1. Prerequisites** (details in [PREREQUISITES.md](PREREQUISITES.md))
+- **Python 3.9+** — the only hard requirement.
+- **GPU power:** the NVIDIA driver, so `nvidia-smi` works (gives *measured* GPU power).
+- **Best whole-machine accuracy (optional):** read-only BMC/IPMI/Redfish access.
+
+**2. Get the collector**
+```bash
+git clone https://github.com/anvitashukla4u-jpg/Aareka_open_source.git
+cd Aareka_open_source
+```
+
+**3. Point it at the pilot.** The URL is fixed; the key was sent to you privately —
+keep it secret, don't commit it.
+```bash
+export AAREKA_INGEST_URL="https://aareka.aicontransformation.com"
+export AAREKA_ORG_KEY="<the org key we emailed you>"
+# Optional: label who owns what. Maps a process name or VM name -> a department.
+export AAREKA_DEPT_MAP='{"training-job":"Research","inference-svc":"Platform"}'
+```
+
+**4. Send one batch and read the receipt**
+```bash
+python aareka_sender.py --once
+```
+Expected output (numbers illustrative):
+```
+  Aareka sender  ->  https://aareka.aicontransformation.com   host=gpu-node-01
+  sent full (watts + ownership) -> HTTP 200: readings=3 attributed=2
+      Research          440.5 W
+      Platform           59.5 W
+```
+
+**5. See it on your dashboard.** Go to **aareka.aicontransformation.com**, click
+**Create account**, and register with your email, a password you choose, and the
+**same org key** from step 3. You land straight on your dashboard — workloads,
+departments, and measured-vs-estimated power. Your login only ever shows *your*
+organisation's data. (Next time, just **Sign in**.)
+
+**Keep it running** (send every 60 s instead of once):
+```bash
+python aareka_sender.py            # Ctrl+C to stop
+```
+
+**No GPU handy?** You can exercise the vGPU/MIG path from a saved dump:
+```bash
+export AAREKA_VGPU_QFILE=/path/to/nvidia-smi-vgpu-q.txt
+python aareka_sender.py --once
+```
+
+Trouble sending? `python aareka_sender.py --once` prints the exact HTTP error. The
+most common causes are a wrong/missing `AAREKA_ORG_KEY` (HTTP 401) or no outbound
+HTTPS to `aareka.aicontransformation.com`.
+
+---
+
 ## The problem
 
 You started running AI in datacenters you own. Your power draw jumped, unpredictably,
