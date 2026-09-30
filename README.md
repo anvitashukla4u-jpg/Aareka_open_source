@@ -81,24 +81,113 @@ HTTPS to `aareka.aicontransformation.com`.
 
 ---
 
-## Deployment modes
+## Deployment modes — where to install, and what access it needs
 
-Aareka collects from four kinds of estate — set `AAREKA_SOURCE`. The **bare-metal (`local`)
-path is stable**; **`vcenter`, `kubernetes`, and `fleet` are beta** — the code is complete
-and tested against fixtures, and validates against your real environment on first connect.
+Aareka collects in one of four modes, selected with the `AAREKA_SOURCE` environment
+variable. In every mode the collector is **read-only**: it makes **outbound HTTPS calls
+only** to the ingest API, never opens an inbound port on your machines, and never writes to
+or issues commands against your systems. Bare-metal (`local`) is stable; the `vcenter`,
+`kubernetes`, and `fleet` modes are **beta** — the code is complete and tested against
+fixtures, and is validated against your real environment on first connect.
 
-| `AAREKA_SOURCE` | Runs on | What it reads | Connectivity | Status |
-|---|---|---|---|---|
-| `local` *(default)* | each GPU node | nvidia-smi power + per-process / vGPU-MIG ownership | outbound HTTPS 443 | **stable** |
-| `vcenter` | one machine that can reach vCenter | one read-only vCenter connection: host-total power + per-VM vCPU/memory + GPU assignment + department tags | vCenter API 443 (read-only account) + 443 out | beta |
-| `kubernetes` | one machine with a kubeconfig, or in-cluster | node→pod topology + labels (K8s API); power from Prometheus (DCGM-exporter / node-exporter) | K8s API 443 (read-only) + Prometheus HTTP + 443 out | beta |
-| `fleet` | one control node | sweeps many servers for power (SSH / Prometheus); attributes each whole server to its business unit via an IT-supplied server→BU map | SSH 22 / Prometheus to nodes + 443 out | beta |
+| `AAREKA_SOURCE` | Install it on | Access it needs | Status |
+|---|---|---|---|
+| `local` | each GPU server | local `nvidia-smi`; outbound HTTPS | stable |
+| `vcenter` | one machine that can reach vCenter | read-only vCenter account; outbound HTTPS | beta |
+| `kubernetes` | one machine with a kubeconfig, or in-cluster | read-only Kubernetes API + Prometheus; outbound HTTPS | beta |
+| `fleet` | one control node | read-only SSH (or Prometheus/BMC) to the servers; outbound HTTPS | beta |
 
-Ownership has **two layers**: *topology* (which workload runs where — read automatically) and
-*tags* (which team/BU owns it — from vSphere attributes, K8s labels, or a mapping your IT team
-supplies via `AAREKA_DEPT_MAP` / `AAREKA_HOST_DEPT_MAP`). Untagged power lands in an honest
-"unmapped" bucket until tagged. See [PREREQUISITES.md](PREREQUISITES.md) for the exact
-packages, accounts, and env vars per mode.
+### Bare metal (`local`)
+
+Install the collector on **each GPU server** you want to measure; a single server is enough
+for a first test. It reads that machine directly, so it needs:
+
+- the **NVIDIA driver**, so that `nvidia-smi` works — this provides measured GPU power and
+  identifies which process is using each GPU;
+- optionally, permission to read the CPU energy counter (root on Linux) for measured CPU power;
+- optionally, **read-only** access to the server's management controller (BMC / iDRAC / iLO,
+  via Redfish or IPMI) for an exact whole-machine total;
+- **outbound HTTPS (port 443)** to the ingest API. Nothing needs to be opened inbound.
+
+### VMware / vCenter (`vcenter`)
+
+Install the collector on **one machine that can reach your vCenter over the network**. You do
+**not** install anything on the ESXi hosts or inside the virtual machines. A single read-only
+connection to vCenter returns everything Aareka needs: each host's total power, every virtual
+machine's vCPU and memory allocation, its GPU assignment (passthrough or vGPU), and its
+department tag. It needs:
+
+- a **read-only vCenter account**;
+- network access to the **vCenter API (TCP 443)**;
+- **outbound HTTPS (port 443)** to the ingest API.
+
+### Kubernetes (`kubernetes`)
+
+Install the collector on **one machine that holds a read-only kubeconfig**, or run it inside
+the cluster as a pod with a read-only service account. Kubernetes supplies the topology — which
+pod runs on which node, with its CPU request, memory, GPU count and labels — while the power
+figures come from your monitoring stack. It needs:
+
+- **read-only access to the Kubernetes API (TCP 443)**;
+- a **Prometheus** endpoint that scrapes `dcgm-exporter` (GPU power) and `node-exporter`
+  (CPU power);
+- **outbound HTTPS (port 443)** to the ingest API.
+
+### Fleet — many bare-metal servers from one place (`fleet`)
+
+When you have many bare-metal servers and would rather not install an agent on each one, run
+the collector on **one control node** that can already reach them. It sweeps every server for
+its total power and attributes each whole server to its owning business unit using the mapping
+your IT team provides (see below). It needs:
+
+- **read-only SSH** to each server (or their Prometheus / BMC endpoints);
+- **outbound HTTPS (port 443)** to the ingest API.
+
+---
+
+## What we need from your IT team — the ownership mapping
+
+Aareka answers two questions, and it can only answer the second one with your help:
+
+1. **How much power did each workload draw?** — measured automatically, in every mode.
+2. **Which team, application, or business unit owns that power?** — this is an *ownership
+   fact*, not something that can be inferred from telemetry, so it has to come from you.
+
+Ownership is expressed as a simple mapping, and where it comes from depends on the estate:
+
+- **VMware:** ideally the department is already recorded on each VM as a vCenter **custom
+  attribute or tag**, which Aareka reads directly. If it isn't, you can supply a
+  VM-name → business-unit mapping instead.
+- **Kubernetes:** the owning team is usually already expressed as a **label** (for example
+  `app` or `team`) or as the **namespace**, both of which Aareka reads. An explicit mapping
+  can override this.
+- **Bare metal / fleet:** there is no orchestrator to read, so your IT team provides a simple
+  **server → application/business-unit** list (for example, `gpu-node-01 → Research`). This is
+  the single most important input for a bare-metal deployment.
+
+In one sentence: the one thing we need from your IT team is **a list of which server, VM, or
+pod belongs to which application or business unit.**
+
+## If the ownership mapping isn't available
+
+Aareka never guesses ownership and never blocks on it. If the mapping is missing or only
+partial:
+
+- **Power is still measured and attributed** down to each workload, VM, pod, or server, and
+  the totals still reconcile. You get an accurate picture of *how much* power is being drawn
+  and *where* — which machine, which workload.
+- **What you lose is the business roll-up.** Anything without an owner appears in an honest
+  **"unmapped"** bucket rather than rolling up to a named department. You will see that, for
+  example, 40 kW is unattributed — but not which team it should be charged to.
+- **Nothing is fabricated.** Unmapped power is clearly labeled as such; it is never quietly
+  assigned to the wrong team.
+
+In practice this means you can deploy and start measuring straight away, and the
+department-level showback becomes complete as you fill in the ownership mapping. Providing it
+up front simply means your very first report already rolls up cleanly to business units.
+
+See [PREREQUISITES.md](PREREQUISITES.md) for the exact packages, accounts, and environment
+variables required by each mode.
 
 ---
 
