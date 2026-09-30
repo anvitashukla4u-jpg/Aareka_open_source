@@ -73,13 +73,114 @@ class VCenterConnector:
         self.department_attribute = department_attribute
 
     def _connect(self):
-        # real: SmartConnect(host=self.vcenter, user=self.user, pwd=self.pwd)
-        raise NotImplementedError("wire pyVmomi, or inject via _fetch_hosts")
+        """Open a READ-ONLY pyVmomi connection. Needs 'pyvmomi'. Honors
+        AAREKA_VCENTER_INSECURE=1 for self-signed lab certs (default: verify)."""
+        try:
+            from pyVim.connect import SmartConnect
+        except ImportError as e:
+            raise RuntimeError("pyVmomi not installed (pip install pyvmomi)") from e
+        import os
+        import ssl
+        if not (self.vcenter and self.user and self.pwd):
+            raise RuntimeError("vCenter host/user/password not set "
+                               "(AAREKA_VCENTER / _USER / _PASSWORD)")
+        ctx = None
+        if os.environ.get("AAREKA_VCENTER_INSECURE", "").lower() in ("1", "true", "yes"):
+            ctx = ssl._create_unverified_context()
+        return SmartConnect(host=self.vcenter, user=self.user, pwd=self.pwd,
+                            sslContext=ctx)
 
+    # --- LIVE READ (the only un-fixture-testable layer; needs a real vCenter) ---
+    # All pyVmomi calls are isolated in _fetch_hosts + its helpers; they return
+    # plain dicts of the SAME shape the mock uses, so hosts() and everything
+    # downstream (attribution) is fully testable without vSphere.
     def _fetch_hosts(self) -> list[dict]:
-        """Return raw host dicts. Real impl walks the vCenter inventory; here it
-        is overridden in tests with mock data of the same shape."""
-        raise NotImplementedError("wire pyVmomi, or inject via _fetch_hosts")
+        """Walk the live vCenter inventory READ-ONLY -> host dicts. Requires a
+        real vCenter (validated on first connect)."""
+        from pyVim.connect import Disconnect
+        from pyVmomi import vim
+        si = self._connect()
+        try:
+            content = si.RetrieveContent()
+            counter_id = self._power_counter_id(content)
+            field_name = self._custom_field_names(content)
+            view = content.viewManager.CreateContainerView(
+                content.rootFolder, [vim.HostSystem], True)
+            try:
+                return [self._host_dict(content, h, counter_id, field_name, vim)
+                        for h in view.view]
+            finally:
+                view.Destroy()
+        finally:
+            Disconnect(si)
+
+    @staticmethod
+    def _power_counter_id(content):
+        """Resolve the 'power.power.average' (Watts) performance counter id."""
+        for c in content.perfManager.perfCounter:
+            if (c.groupInfo.key == "power" and c.nameInfo.key == "power"
+                    and str(c.rollupType) == "average"):
+                return c.key
+        return None
+
+    @staticmethod
+    def _custom_field_names(content) -> dict:
+        cfm = getattr(content, "customFieldsManager", None)
+        return {f.key: f.name for f in (cfm.field or [])} if cfm else {}
+
+    def _host_dict(self, content, host, counter_id, field_name, vim) -> dict:
+        vms = []
+        for vm in (host.vm or []):
+            cfg = getattr(vm, "config", None)
+            if cfg is None or getattr(cfg, "template", False):
+                continue                                  # skip templates / no config
+            hw = cfg.hardware
+            attrs = {}
+            for cv in (getattr(vm, "customValue", None) or []):
+                nm = field_name.get(cv.key)
+                if nm:
+                    attrs[nm] = cv.value
+            vms.append({
+                "name": vm.name,
+                "vcpu": int(getattr(hw, "numCPU", 0) or 0),
+                "mem_mb": float(getattr(hw, "memoryMB", 0) or 0),
+                "gpu": self._vm_gpu(hw, vim),
+                "custom_attributes": attrs,
+            })
+        return {"name": host.name,
+                "power_w": self._host_power_w(content, host, counter_id, vim),
+                "vms": vms}
+
+    @staticmethod
+    def _host_power_w(content, host, counter_id, vim):
+        """Latest host-total power in Watts from the vSphere power counter."""
+        if counter_id is None:
+            return None
+        try:
+            metric = vim.PerformanceManager.MetricId(counterId=counter_id, instance="")
+            spec = vim.PerformanceManager.QuerySpec(
+                entity=host, metricId=[metric], intervalId=20, maxSample=1)
+            res = content.perfManager.QueryPerf(querySpec=[spec])
+            if res and res[0].value and res[0].value[0].value:
+                return float(res[0].value[0].value[-1])
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _vm_gpu(hw, vim) -> dict:
+        """passthrough vs vGPU from the VM's virtual PCI devices. The VmiopBacking
+        marks a vGPU (and carries the profile); a plain passthrough backing is a
+        whole-card DirectPath device."""
+        for dev in (getattr(hw, "device", None) or []):
+            if isinstance(dev, vim.vm.device.VirtualPCIPassthrough):
+                backing = getattr(dev, "backing", None)
+                vmiop = getattr(vim.vm.device.VirtualPCIPassthrough, "VmiopBackingInfo", None)
+                if vmiop is not None and isinstance(backing, vmiop):
+                    return {"mode": "vgpu", "profile": getattr(backing, "vgpu", None),
+                            "gpu_ids": []}
+                return {"mode": "passthrough", "gpu_ids": []}
+        return {}
 
     def hosts(self) -> list[HostInfo]:
         out = []

@@ -81,6 +81,27 @@ HTTPS to `aareka.aicontransformation.com`.
 
 ---
 
+## Deployment modes
+
+Aareka collects from four kinds of estate — set `AAREKA_SOURCE`. The **bare-metal (`local`)
+path is stable**; **`vcenter`, `kubernetes`, and `fleet` are beta** — the code is complete
+and tested against fixtures, and validates against your real environment on first connect.
+
+| `AAREKA_SOURCE` | Runs on | What it reads | Connectivity | Status |
+|---|---|---|---|---|
+| `local` *(default)* | each GPU node | nvidia-smi power + per-process / vGPU-MIG ownership | outbound HTTPS 443 | **stable** |
+| `vcenter` | one machine that can reach vCenter | one read-only vCenter connection: host-total power + per-VM vCPU/memory + GPU assignment + department tags | vCenter API 443 (read-only account) + 443 out | beta |
+| `kubernetes` | one machine with a kubeconfig, or in-cluster | node→pod topology + labels (K8s API); power from Prometheus (DCGM-exporter / node-exporter) | K8s API 443 (read-only) + Prometheus HTTP + 443 out | beta |
+| `fleet` | one control node | sweeps many servers for power (SSH / Prometheus); attributes each whole server to its business unit via an IT-supplied server→BU map | SSH 22 / Prometheus to nodes + 443 out | beta |
+
+Ownership has **two layers**: *topology* (which workload runs where — read automatically) and
+*tags* (which team/BU owns it — from vSphere attributes, K8s labels, or a mapping your IT team
+supplies via `AAREKA_DEPT_MAP` / `AAREKA_HOST_DEPT_MAP`). Untagged power lands in an honest
+"unmapped" bucket until tagged. See [PREREQUISITES.md](PREREQUISITES.md) for the exact
+packages, accounts, and env vars per mode.
+
+---
+
 ## The problem
 
 You started running AI in datacenters you own. Your power draw jumped, unpredictably,

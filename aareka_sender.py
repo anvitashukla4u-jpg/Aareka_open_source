@@ -11,9 +11,21 @@ Runs inside the customer's environment. On an interval it:
     3. packages watts + ownership into the Ingest API's batch shape,
     4. POSTs it to your Ingest API, authenticated with the customer's org key.
 
-Read-only. Outbound HTTPS only. Standard library only.
+Read-only. Outbound HTTPS only. (local mode: stdlib only; vCenter/Kubernetes
+modes add pyvmomi / kubernetes.)
 
-Ownership sources (in priority order, per GPU):
+Sources (AAREKA_SOURCE):
+    * local (default) - THIS machine: nvidia-smi power + per-process / vGPU-MIG
+                        ownership. One batch (this host).
+    * vcenter         - one read-only vCenter connection: host-total power + VM
+                        topology + department tags. One batch per ESXi host.
+    * kubernetes      - one read-only kubeconfig: node->pod topology + labels,
+                        power from Prometheus. One batch per node.
+    * fleet           - one control node sweeps many servers (SSH/Prometheus) for
+                        power; the IT-team server->BU map (AAREKA_HOST_DEPT_MAP)
+                        attributes each whole server to its BU. One batch per server.
+
+Ownership sources (local, in priority order per GPU):
     * vGPU / MIG slices  -> `nvidia-smi vgpu -q` (a vGPU/MIG-configured host).
                            mode = vgpu (or mig via AAREKA_GPU_MODE); split by FB.
     * per-process        -> `nvidia-smi --query-compute-apps` (bare metal).
@@ -22,12 +34,26 @@ Ownership sources (in priority order, per GPU):
 Config (environment variables, or the matching --flags):
     AAREKA_INGEST_URL   your Ingest API base URL                     (required)
     AAREKA_ORG_KEY      the customer's secret key                    (required)
+    AAREKA_SOURCE       local (default) | vcenter | kubernetes
     AAREKA_INTERVAL     seconds between sends (default 60)
-    AAREKA_HOST         host label (default: hostname)
+    AAREKA_HOST         host label (default: hostname)               (local mode)
     AAREKA_DEPT_MAP     JSON {workload_or_vm_name: department}        (optional tags)
     AAREKA_GPU_MODE     "vgpu" (default) or "mig" - label for read partitions
     AAREKA_VGPU_QFILE   path to a saved `nvidia-smi vgpu -q` dump (testing/injection)
     AAREKA_PROM_URL / AAREKA_BMC / AAREKA_IPMI / AAREKA_PDU          (telemetry endpoints)
+  vCenter mode (AAREKA_SOURCE=vcenter):
+    AAREKA_VCENTER            vCenter host/IP                         (required)
+    AAREKA_VCENTER_USER       read-only user                         (required)
+    AAREKA_VCENTER_PASSWORD   password                               (required)
+    AAREKA_VCENTER_DEPT_ATTR  custom-attribute name holding department (optional)
+    AAREKA_VCENTER_INSECURE   "1" to skip TLS verify (self-signed labs)
+  Kubernetes mode (AAREKA_SOURCE=kubernetes):
+    AAREKA_KUBECONFIG         path to kubeconfig (default: in-cluster / ~/.kube)
+    AAREKA_PROM_URL           Prometheus base URL for node/GPU power (recommended)
+  Fleet mode (AAREKA_SOURCE=fleet):
+    AAREKA_INVENTORY          path to JSON list of node specs (host, rack, transport,
+                              prom_url/bmc/ipmi/pdu per node)
+    AAREKA_HOST_DEPT_MAP      JSON {server_hostname: application/BU}  (from the IT team)
 
 Run:
     python aareka_sender.py            # loop forever
@@ -50,7 +76,7 @@ from datetime import datetime, timezone
 
 import imp_server_power_source as sps
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 
 def _iso_now() -> str:
@@ -259,6 +285,165 @@ def build_flat_batch(sp: "sps.ServerPower", host: str) -> dict:
     }
 
 
+# ------------------------------------------------------- vCenter (VMware) source
+def _make_vcenter(cfg: dict):
+    from vcenter_connector import VCenterConnector
+    if not (cfg.get("vcenter") and cfg.get("vc_user") and cfg.get("vc_pwd")):
+        raise RuntimeError("vcenter mode needs AAREKA_VCENTER, AAREKA_VCENTER_USER "
+                           "and AAREKA_VCENTER_PASSWORD")
+    return VCenterConnector(vcenter=cfg["vcenter"], user=cfg["vc_user"],
+                            pwd=cfg["vc_pwd"],
+                            department_attribute=cfg.get("vc_dept_attr"))
+
+
+def build_vcenter_batches(connector, dept_map: dict) -> list:
+    """One batch per ESXi host. vCenter gives, in a single read: the measured
+    whole-host power (a node_total) and each VM's vCPU/memory + department tag.
+    The engine splits that measured total across the VMs by vCPU + memory
+    allocation -> per-VM, per-department attribution. Per-GPU watts are not
+    exposed by vCenter, so this is an allocation split of a MEASURED total
+    (estimated per VM), which the engine labels accordingly. A department from
+    the VM's vCenter attribute wins; AAREKA_DEPT_MAP is a fallback override."""
+    batches = []
+    for host in connector.hosts():
+        if not host.vms:
+            continue
+        total_vcpu = sum(v.vcpu for v in host.vms) or 1e-9
+        workloads = []
+        for v in host.vms:
+            workloads.append({
+                "id": v.name, "kind": "vm",
+                "cpu_share": round(v.vcpu / total_vcpu, 4),
+                "mem_mb": float(v.mem_mb),
+                "gpu_ids": list(v.gpu_ids),
+                "department": v.department or dept_map.get(v.name),
+            })
+        batch = {"host": host.name, "captured_at": _iso_now(),
+                 "collector_version": VERSION, "gpus": [], "cpu_readings": [],
+                 "workloads": workloads}
+        if host.power_w is not None:
+            batch["node_total_w"] = round(float(host.power_w), 2)
+            batch["node_total_method"] = "measured"
+        batches.append(batch)
+    return batches
+
+
+# ------------------------------------------------------- Kubernetes source
+def _k8s_node_power(prom_url: str, node_label: str = "Hostname") -> dict:
+    """Per-node power from Prometheus: GPU from dcgm-exporter, CPU from
+    node-exporter RAPL, grouped by node. Returns {node_label_value: {gpu_w, cpu_w}}.
+    This is the fragile, site-specific seam (metric/label names vary by install) -
+    isolated here and validated on first connect; the join + attribution below is
+    fixture-tested independently."""
+    out: dict = {}
+
+    def add(promql: str, key: str):
+        for s in (sps._prom_query(prom_url, promql) or []):
+            m = s.get("metric", {})
+            node = m.get(node_label) or m.get("instance") or m.get("node")
+            val = (s.get("value") or [None, None])[1]
+            if node is None or val is None:
+                continue
+            try:
+                w = float(val)
+            except (TypeError, ValueError):
+                continue
+            out.setdefault(node, {"gpu_w": 0.0, "cpu_w": 0.0})[key] += w
+
+    add(f"sum by ({node_label}) (DCGM_FI_DEV_POWER_USAGE)", "gpu_w")
+    add(f"sum by ({node_label}) (rate(node_rapl_package_joules_total[1m]))", "cpu_w")
+    return out
+
+
+def _match_node_power(node: str, node_power: dict) -> "dict | None":
+    """Best-effort join between a K8s node name and a Prometheus label value
+    (FQDN / :port differences). Exact first, then short hostname."""
+    if node in node_power:
+        return node_power[node]
+    short = node.split(".")[0]
+    for k, v in node_power.items():
+        if k.split(".")[0].split(":")[0] == short:
+            return v
+    return None
+
+
+def build_k8s_batches(cfg: dict, reader=None, node_power=None) -> list:
+    """One batch per Kubernetes node. Topology (node->pods, CPU request, memory,
+    GPU count, labels) comes from the K8s API; per-node power from Prometheus.
+    The engine splits each node's measured power across its pods by CPU-request +
+    memory allocation, tagged to a department (AAREKA_DEPT_MAP by app label or
+    namespace; namespace is the default). `reader` / `node_power` are injectable
+    for testing."""
+    from imp_topology import K8sReader
+    if reader is None:
+        reader = K8sReader(kubeconfig=cfg.get("kubeconfig"))
+    tree = reader.tree()                                   # {node: [Child(pod), ...]}
+    if node_power is None:
+        prom = cfg.get("prom")
+        if not prom:
+            raise RuntimeError("kubernetes mode needs AAREKA_PROM_URL (per-node power "
+                               "from dcgm-exporter / node-exporter)")
+        node_power = _k8s_node_power(prom, cfg.get("prom_node_label", "Hostname"))
+
+    dept_map = cfg.get("dept_map", {})
+    batches = []
+    for node, pods in tree.items():
+        pw = _match_node_power(node, node_power)
+        if pw is None:
+            print(f"  k8s: no Prometheus power for node {node} - skipping")
+            continue
+        total = pw.get("gpu_w", 0.0) + pw.get("cpu_w", 0.0)
+        if total <= 0:
+            continue
+        workloads = []
+        for pod in pods:
+            ns = pod.cid.split("/", 1)[0]
+            app = getattr(pod, "app", None)
+            workloads.append({
+                "id": pod.cid, "kind": "pod",
+                "cpu_share": round(pod.cpu_share, 4),
+                "mem_mb": float(pod.mem_mb),
+                "gpu_ids": list(pod.gpu_ids),
+                "department": dept_map.get(app) or dept_map.get(ns) or ns,
+            })
+        batches.append({"host": node, "captured_at": _iso_now(),
+                        "collector_version": VERSION, "gpus": [], "cpu_readings": [],
+                        "workloads": workloads,
+                        "node_total_w": round(total, 2), "node_total_method": "measured"})
+    return batches
+
+
+# ------------------------------------------------------- fleet source (bare-metal, one control node)
+def build_fleet_batches(cfg: dict, results=None) -> list:
+    """One control node sweeps many servers (SSH / Prometheus / local) and rolls
+    each server's MEASURED total power up to its owning application/BU using the
+    IT-team-supplied server->BU map (Layer 2 ownership). Coarser than per-workload
+    attribution, but real: whole-server power -> BU. `results` is injectable for
+    testing (else poll the inventory)."""
+    import imp_compute_fleet_power as fleet
+    if results is None:
+        inv_path = cfg.get("inventory")
+        if not inv_path:
+            raise RuntimeError("fleet mode needs AAREKA_INVENTORY (JSON list of node "
+                               "specs: host, rack, transport, endpoints)")
+        specs = [fleet.NodeSpec(**d) for d in json.load(open(inv_path))]
+        results = fleet.poll_fleet(specs)
+    host_dept = cfg.get("host_dept_map", {})               # server -> application/BU (from IT)
+    batches = []
+    for r in results:
+        if r.status is not fleet.NodeStatus.OK or r.total_w <= 0:
+            continue
+        method = "measured" if r.measured_w >= r.modeled_w else "modeled"
+        batches.append({
+            "host": r.host, "captured_at": _iso_now(), "collector_version": VERSION,
+            "gpus": [], "cpu_readings": [],
+            "workloads": [{"id": r.host, "kind": "server", "cpu_share": 1.0,
+                           "mem_mb": 0.0, "gpu_ids": [],
+                           "department": host_dept.get(r.host)}],
+            "node_total_w": round(r.total_w, 2), "node_total_method": method})
+    return batches
+
+
 def post_batch(base_url: str, key: str, batch: dict, timeout: float = 10.0):
     data = json.dumps(batch).encode("utf-8")
     req = urllib.request.Request(
@@ -268,32 +453,54 @@ def post_batch(base_url: str, key: str, batch: dict, timeout: float = 10.0):
         return resp.status, json.loads(resp.read().decode("utf-8"))
 
 
-def run_once(cfg: dict) -> bool:
+def collect_batches(cfg: dict) -> list:
+    """Build the batch(es) to send this cycle, per AAREKA_SOURCE. local -> one
+    batch (this host); vcenter/kubernetes -> one per host/node."""
+    src = cfg.get("source", "local")
+    if src == "vcenter":
+        return build_vcenter_batches(_make_vcenter(cfg), cfg["dept_map"])
+    if src == "kubernetes":
+        return build_k8s_batches(cfg)
+    if src == "fleet":
+        return build_fleet_batches(cfg)
+    # local (default)
     sp = sps.read_server_power(prom_url=cfg.get("prom"), bmc=cfg.get("bmc"),
                                ipmi=cfg.get("ipmi"), pdu=cfg.get("pdu"))
     if not sp.readings:
-        print("  no readings from any source this cycle - nothing to send")
-        return False
-    batch = build_full_batch(sp, cfg["host"], cfg["dept_map"])
-    shape = "full (watts + ownership)"
-    if batch is None:
-        batch = build_flat_batch(sp, cfg["host"])
-        shape = "flat (watts only - no GPU ownership found)"
+        return []
+    batch = build_full_batch(sp, cfg["host"], cfg["dept_map"]) \
+        or build_flat_batch(sp, cfg["host"])
+    return [batch]
+
+
+def run_once(cfg: dict) -> bool:
     try:
-        status, body = post_batch(cfg["url"], cfg["key"], batch)
-        print(f"  sent {shape} -> HTTP {status}: "
-              f"readings={body.get('stored_readings', body.get('stored'))} "
-              f"attributed={body.get('attributed_workloads', 0)}")
-        attr = body.get("attribution")
-        if attr and attr.get("by_department"):
-            for d in attr["by_department"]:
-                print(f"      {d['department']:<14} {d['watts']:>8} W")
-        return True
-    except urllib.error.HTTPError as e:
-        print(f"  ingest rejected: HTTP {e.code} {e.read().decode('utf-8','ignore')[:200]}")
-    except (urllib.error.URLError, OSError) as e:
-        print(f"  could not reach ingest at {cfg['url']}: {e}")
-    return False
+        batches = collect_batches(cfg)
+    except Exception as e:
+        print(f"  collection failed ({cfg.get('source','local')}): {e}")
+        return False
+    if not batches:
+        print("  nothing to send this cycle")
+        return False
+    ok_any = False
+    for batch in batches:
+        host = batch.get("host", "?")
+        try:
+            status, body = post_batch(cfg["url"], cfg["key"], batch)
+            print(f"  {host}: HTTP {status}  "
+                  f"readings={body.get('stored_readings', body.get('stored'))}  "
+                  f"attributed={body.get('attributed_workloads', 0)}")
+            attr = body.get("attribution")
+            if attr and attr.get("by_department"):
+                for d in attr["by_department"]:
+                    print(f"      {d['department']:<14} {d['watts']:>8} W")
+            ok_any = True
+        except urllib.error.HTTPError as e:
+            print(f"  {host}: ingest rejected HTTP {e.code} "
+                  f"{e.read().decode('utf-8', 'ignore')[:200]}")
+        except (urllib.error.URLError, OSError) as e:
+            print(f"  {host}: could not reach ingest at {cfg['url']}: {e}")
+    return ok_any
 
 
 def load_cfg(args) -> dict:
@@ -309,8 +516,19 @@ def load_cfg(args) -> dict:
             dept_map = dict(json.loads(raw))
         except (ValueError, TypeError):
             print("  warning: AAREKA_DEPT_MAP is not valid JSON - ignoring")
+    source = (args.source or os.environ.get("AAREKA_SOURCE") or "local").lower()
+    if source not in ("local", "vcenter", "kubernetes", "fleet"):
+        sys.exit(f"error: AAREKA_SOURCE must be local|vcenter|kubernetes|fleet "
+                 f"(got '{source}')")
+    host_dept_map = {}
+    raw_hd = os.environ.get("AAREKA_HOST_DEPT_MAP")
+    if raw_hd:
+        try:
+            host_dept_map = dict(json.loads(raw_hd))
+        except (ValueError, TypeError):
+            print("  warning: AAREKA_HOST_DEPT_MAP is not valid JSON - ignoring")
     return {
-        "url": url, "key": key,
+        "url": url, "key": key, "source": source,
         "host": args.host or os.environ.get("AAREKA_HOST") or socket.gethostname(),
         "interval": args.interval or int(os.environ.get("AAREKA_INTERVAL", "60")),
         "dept_map": dept_map,
@@ -318,6 +536,17 @@ def load_cfg(args) -> dict:
         "bmc": os.environ.get("AAREKA_BMC"),
         "ipmi": os.environ.get("AAREKA_IPMI"),
         "pdu": os.environ.get("AAREKA_PDU"),
+        # vCenter mode
+        "vcenter": os.environ.get("AAREKA_VCENTER"),
+        "vc_user": os.environ.get("AAREKA_VCENTER_USER"),
+        "vc_pwd": os.environ.get("AAREKA_VCENTER_PASSWORD"),
+        "vc_dept_attr": os.environ.get("AAREKA_VCENTER_DEPT_ATTR"),
+        # Kubernetes mode
+        "kubeconfig": os.environ.get("AAREKA_KUBECONFIG"),
+        "prom_node_label": os.environ.get("AAREKA_PROM_NODE_LABEL", "Hostname"),
+        # fleet mode
+        "inventory": os.environ.get("AAREKA_INVENTORY"),
+        "host_dept_map": host_dept_map,
     }
 
 
@@ -327,10 +556,12 @@ def main():
     ap.add_argument("--url", help="Ingest API base URL")
     ap.add_argument("--key", help="org key")
     ap.add_argument("--host", help="host label (default: hostname)")
+    ap.add_argument("--source", help="local | vcenter | kubernetes")
     ap.add_argument("--interval", type=int, help="seconds between sends")
     args = ap.parse_args()
     cfg = load_cfg(args)
-    print(f"\n  Aareka sender  ->  {cfg['url']}   host={cfg['host']}")
+    where = cfg["host"] if cfg["source"] == "local" else cfg["source"]
+    print(f"\n  Aareka sender  ->  {cfg['url']}   source={cfg['source']} ({where})")
     if args.once:
         run_once(cfg)
         return

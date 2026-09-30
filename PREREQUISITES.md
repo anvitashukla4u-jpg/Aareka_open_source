@@ -81,12 +81,45 @@ Watch its power live, second by second:
 python imp_live.py
 ```
 
-No servers or GPUs handy? Run the built-in examples — they show the whole thing
-working with realistic made-up data:
+---
+
+## 7. Collecting across a whole estate — vCenter, Kubernetes, or a fleet (beta)
+
+These modes are **beta**: built and tested against fixtures, and validated against your
+real environment on first connect. Pick one with `AAREKA_SOURCE`.
+
+**VMware / vCenter** (`AAREKA_SOURCE=vcenter`) — one machine reaches vCenter; nothing to
+install per host.
 ```bash
-python sim/k8s_sim.py
-python sim/vmware_sim.py
+pip install pyvmomi
+export AAREKA_SOURCE=vcenter
+export AAREKA_VCENTER=vcenter.your.org
+export AAREKA_VCENTER_USER='readonly@vsphere.local'
+export AAREKA_VCENTER_PASSWORD='...'
+export AAREKA_VCENTER_DEPT_ATTR='Department'   # vCenter custom attribute holding the BU
+# export AAREKA_VCENTER_INSECURE=1             # only for self-signed lab certs
 ```
+Needs: a **read-only** vCenter account and network access to the vCenter API (443).
+
+**Kubernetes** (`AAREKA_SOURCE=kubernetes`) — one machine with a kubeconfig, or run in-cluster.
+```bash
+pip install kubernetes
+export AAREKA_SOURCE=kubernetes
+export AAREKA_KUBECONFIG=~/.kube/config        # omit to use in-cluster credentials
+export AAREKA_PROM_URL=http://prometheus:9090  # power from dcgm-exporter / node-exporter
+# export AAREKA_PROM_NODE_LABEL=Hostname       # metric label carrying the node name
+```
+Needs: **read-only** cluster access, and a Prometheus scraping dcgm-exporter (GPU) +
+node-exporter (CPU).
+
+**Fleet** (`AAREKA_SOURCE=fleet`) — one control node sweeps many servers and attributes each
+whole server to its business unit via a map your IT team supplies.
+```bash
+export AAREKA_SOURCE=fleet
+export AAREKA_INVENTORY=inventory.json          # [{"host","rack","transport":"ssh|local","prom_url"/"bmc"/...}]
+export AAREKA_HOST_DEPT_MAP='{"gpu-a":"Research","gpu-b":"Finance"}'   # server -> BU (from IT)
+```
+Needs: read-only SSH to each server (or Prometheus/BMC endpoints) and the server→BU map.
 
 ---
 
@@ -96,6 +129,7 @@ python sim/vmware_sim.py
 - **Want exact whole-machine numbers?** Add read-only access to the server's
   management chip (BMC/IPMI).
 - **Want it mapped to pods/VMs?** Add the Kubernetes or VMware helper.
+- **Whole estate at once?** vCenter, Kubernetes, or fleet mode — section 7 (beta).
 
 Everything it can't measure is shown as an estimate and clearly labeled — never
 disguised as a real reading.
