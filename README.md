@@ -3,10 +3,7 @@
 ## Measure and monitor watts per token with Aareka, the trusted energy ledger for private and hybrid AI datacenters.
 
 **Energy per token, measured.** Point Aareka at the models you already serve, and it
-tells you how much energy each output token costs, broken down by model and by team. In
-our own test, the same model on the same laptop GPU used anywhere from 0.40 joules to
-about 2.9 joules per token. That sevenfold gap came entirely from how the requests were
-served, and it stays invisible until you measure it.
+tells you how much energy each output token costs, broken down by model and by team.
 
 Aareka measures the power your servers draw, covering the GPU, the CPU and the whole
 machine. It turns those readings into a single, confidence-scored figure for the energy
