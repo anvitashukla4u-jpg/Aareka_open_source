@@ -1,6 +1,6 @@
 # Aareka - A Product of AICON Transformation Solutions
 
-**The trusted energy ledger for private and hybrid AI datacenters.**
+**Measure and Monitor the Watts Per Token - The trusted energy ledger for private and hybrid AI datacenters.**
 
 **Energy per token, measured.** Point Aareka at the models you already serve and it
 tells you how many joules each output token costs, per model and per team. On one laptop
