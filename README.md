@@ -2,6 +2,11 @@
 
 **The trusted energy ledger for private and hybrid AI datacenters.**
 
+**Energy per token, measured.** Point Aareka at the models you already serve and it
+tells you how many joules each output token costs, per model and per team. On one laptop
+GPU running the same model, that ranged from 0.40 J to about 2.9 J per token, a 7x gap
+caused only by how requests were served. Nobody sees that gap without metering it.
+
 Aareka reconciles the physical power your servers draw — GPU, CPU, and whole-box —
 into a confidence-scored figure for energy consumed over a reporting interval, and
 attributes it to the workloads, applications, and business units responsible. It
@@ -20,9 +25,10 @@ does it for you.
 ## Quickstart — try Aareka on your own hardware
 
 Self-serve: you create your own private space, get a collector key, run the read-only
-collector on a GPU box, and watch your power get attributed. The collector makes
-outbound HTTPS calls only — it sends power readings and workload ownership, never
-commands, and nothing else leaves your machine.
+collector on a GPU box, and see energy per token for your models alongside power
+attributed to every workload. The collector makes outbound HTTPS calls only — it sends
+power readings, token counts and workload ownership, never commands, and nothing else
+leaves your machine.
 
 **1. Create your space and get your key.** Go to **aareka.aicontransformation.com**,
 click **Create account**, and sign up with your email and a password. Leave *team key*
@@ -48,43 +54,48 @@ export AAREKA_ORG_KEY="<your collector key from the dashboard>"
 export AAREKA_DEPT_MAP='{"training-job":"Research","inference-svc":"Platform"}'
 ```
 
-**5. Send one batch and read the receipt**
+**5. Point it at your inference server — this is what gives you energy per token.**
+Give the collector your inference server's Prometheus `/metrics` page (vLLM, SGLang,
+TGI, or llama.cpp started with `--metrics`). Between sends it integrates GPU power every
+0.5 s into joules and reads the tokens your server produced in the same window.
+```bash
+# vLLM on this machine, on GPU 0:
+export AAREKA_METRICS_URL="http://127.0.0.1:8000/metrics|gpus=0"
+# llama.cpp's counters carry no model name, so label it:
+# export AAREKA_METRICS_URL="http://127.0.0.1:8080/metrics|model=llama3.2-3b|gpus=0"
+# several servers: join entries with ";"   format: <url>[|model=<label>][|gpus=<i,j>]
+```
+The collector only reads your server's counters; it never runs or touches your models.
+*Training-only box with no inference server? Skip this step — power attribution still works.*
+
+**6. Send one batch and read the receipt** (the first send waits one interval, 60 s by
+default, so it has a measured window of tokens and joules)
 ```bash
 python aareka_sender.py --once
 ```
 Expected output (numbers illustrative):
 ```
-  Aareka sender  ->  https://aareka.aicontransformation.com   host=gpu-node-01
-  sent full (watts + ownership) -> HTTP 200: readings=3 attributed=2
+  Aareka sender  ->  https://aareka.aicontransformation.com   source=local (gpu-node-01)
+  metering tokens from http://127.0.0.1:8000/metrics|gpus=0; first send in 60s
+  tokens: vLLM  48210 output tokens in 60s
+  gpu-node-01: HTTP 200  readings=3  attributed=2
       Research          440.5 W
       Platform           59.5 W
 ```
 
-**6. See it on your dashboard.** Refresh **aareka.aicontransformation.com** — your
-workloads, departments, and measured-vs-estimated power appear. Your login only ever
-shows your own space's data.
+**7. See it on your dashboard.** Refresh **aareka.aicontransformation.com**. The
+**Energy per token** panel shows joules per token, tokens per joule and cost per million
+tokens for every model you serve, per model and per department, next to your workloads,
+departments and measured-vs-estimated power. Your login only ever shows your own space's
+data.
 
 **Keep it running** (send every 60 s instead of once):
 ```bash
 python aareka_sender.py            # Ctrl+C to stop
 ```
 
-**Energy per token for your inference servers (optional).** Point the collector at your
-inference server's Prometheus `/metrics` page (vLLM, SGLang, TGI, or llama.cpp started
-with `--metrics`). Between sends it integrates GPU power every 0.5 s into joules and reads
-the tokens the server produced in the same window; your dashboard then shows joules per
-token, tokens per joule and cost per million tokens, per model and per department.
-```bash
-# <metrics url>[|model=<label>][|gpus=<i,j>]; several servers joined by ";"
-export AAREKA_METRICS_URL="http://127.0.0.1:8000/metrics|gpus=0"
-# llama.cpp's counters carry no model name, so label it:
-# export AAREKA_METRICS_URL="http://127.0.0.1:8080/metrics|model=llama3.2-3b|gpus=0"
-python aareka_sender.py            # the first send waits one interval to measure a window
-```
-The collector only measures and sends raw joules and token counts (`imp_token_meter.py`);
-it never runs or touches your models. GPU energy (plus CPU on Linux where RAPL is
-readable) is measured; memory, fans, power-supply losses and cooling are not, so every
-per-token figure is a lower bound.
+GPU energy (plus CPU on Linux where RAPL is readable) is measured; memory, fans,
+power-supply losses and cooling are not, so every per-token figure is a lower bound.
 
 **No GPU handy?** You can exercise the vGPU/MIG path from a saved dump:
 ```bash

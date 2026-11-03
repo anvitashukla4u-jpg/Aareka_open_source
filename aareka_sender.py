@@ -11,10 +11,11 @@ Runs inside the customer's environment. On an interval it:
     3. packages watts + ownership into the Ingest API's batch shape,
     4. POSTs it to your Ingest API, authenticated with the customer's org key.
 
-Optionally (AAREKA_METRICS_URL) it also meters INFERENCE: GPU energy integrated
-between sends plus the tokens the customer's own inference servers (vLLM,
-SGLang, TGI, llama.cpp) produced in the same window, via imp_token_meter. Raw
-joules and token counts only - the efficiency maths runs on the AWS side.
+It also meters INFERENCE - the data behind energy per token: GPU energy
+integrated between sends plus the tokens the customer's own inference servers
+(vLLM, SGLang, TGI, llama.cpp) produced in the same window, via imp_token_meter
+(set AAREKA_METRICS_URL; boxes with no inference server skip it). Raw joules and
+token counts only - the efficiency maths runs on the AWS side.
 
 Read-only. Outbound HTTPS only. (local mode: stdlib only; vCenter/Kubernetes
 modes add pyvmomi / kubernetes.)
@@ -45,7 +46,7 @@ Config (environment variables, or the matching --flags):
     AAREKA_DEPT_MAP     JSON {workload_or_vm_name: department}        (optional tags)
     AAREKA_GPU_MODE     "vgpu" (default) or "mig" - label for read partitions
     AAREKA_VGPU_QFILE   path to a saved `nvidia-smi vgpu -q` dump (testing/injection)
-    AAREKA_METRICS_URL  inference server /metrics to meter tokens from (optional),
+    AAREKA_METRICS_URL  inference server /metrics to meter energy per token from,
                         "<url>[|model=<label>][|gpus=<i,j>]", several joined by ";"
     AAREKA_TOKEN_POLL   seconds between token-counter reads (default 5)
     AAREKA_PROM_URL / AAREKA_BMC / AAREKA_IPMI / AAREKA_PDU          (telemetry endpoints)
