@@ -28,7 +28,34 @@ when something can't be measured — it never makes a number up.
 
 ---
 
-## 3. To measure CPU power
+## 3. To measure energy per token
+
+The Collector reads token counts from your inference server's metrics page. It does
+not need access to your models, prompts or responses.
+
+- **Your inference server must publish metrics.**
+  - vLLM and TGI do this by default.
+  - SGLang needs to be started with `--enable-metrics`.
+  - llama.cpp needs to be started with `--metrics`.
+  - Ollama and LM Studio don't publish token metrics, so they are not supported yet.
+- **The Collector must be able to reach that page.** Run it on the same machine as the
+  inference server, or on a machine that can reach it over your internal network — for
+  example `http://<server>:8000/metrics` for vLLM.
+- **If your metrics page needs a login, or only your monitoring system may read it,**
+  allow the Collector's machine to read it. The Collector cannot send credentials to the
+  metrics page yet.
+- **Tell the Collector where to look** by setting `AAREKA_METRICS_URL`, as shown in step 5
+  of the README Quickstart.
+
+To check it works, open the metrics address in a browser or run:
+```bash
+curl http://<server>:8000/metrics
+```
+You should see lines containing `tokens_total`.
+
+---
+
+## 4. To measure CPU power
 
 - **On Linux:** the Collector reads the CPU's built-in energy meter automatically —
   a real measurement. You just need permission to read it (usually root).
@@ -41,7 +68,7 @@ when something can't be measured — it never makes a number up.
 
 ---
 
-## 4. For the most accurate whole-machine number (optional, but best)
+## 5. For the most accurate whole-machine number (optional, but best)
 
 Servers usually have a small management chip that knows the machine's *total* power
 from the wall — including fans, disks, and power-supply loss. It goes by names like
@@ -55,7 +82,7 @@ from the wall — including fans, disks, and power-supply loss. It goes by names
 
 ---
 
-## 5. If you run Kubernetes or VMware (optional)
+## 6. If you run Kubernetes or VMware (optional)
 
 To automatically match power to your pods or VMs, install the matching helper:
 
@@ -69,7 +96,7 @@ read-only vCenter login.
 
 ---
 
-## 6. Try it right now
+## 7. Try it right now
 
 Measure the machine you're on:
 ```bash
@@ -83,7 +110,7 @@ python imp_live.py
 
 ---
 
-## 7. Collecting across a whole estate — vCenter, Kubernetes, or a fleet (beta)
+## 8. Collecting across a whole estate — vCenter, Kubernetes, or a fleet (beta)
 
 These modes are **beta**: built and tested against fixtures, and validated against your
 real environment on first connect. Pick one with `AAREKA_SOURCE`.
@@ -126,10 +153,12 @@ Needs: read-only SSH to each server (or Prometheus/BMC endpoints) and the server
 ## In short
 
 - **Just want to try it?** Python + the NVIDIA driver. Nothing else.
+- **Want energy per token?** Your inference server's metrics page, reachable from the
+  Collector (section 3).
 - **Want exact whole-machine numbers?** Add read-only access to the server's
   management chip (BMC/IPMI).
 - **Want it mapped to pods/VMs?** Add the Kubernetes or VMware helper.
-- **Whole estate at once?** vCenter, Kubernetes, or fleet mode — section 7 (beta).
+- **Whole estate at once?** vCenter, Kubernetes, or fleet mode — section 8 (beta).
 
 Everything it can't measure is shown as an estimate and clearly labeled — never
 disguised as a real reading.
