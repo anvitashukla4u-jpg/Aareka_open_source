@@ -11,6 +11,11 @@ Runs inside the customer's environment. On an interval it:
     3. packages watts + ownership into the Ingest API's batch shape,
     4. POSTs it to your Ingest API, authenticated with the customer's org key.
 
+Optionally (AAREKA_METRICS_URL) it also meters INFERENCE: GPU energy integrated
+between sends plus the tokens the customer's own inference servers (vLLM,
+SGLang, TGI, llama.cpp) produced in the same window, via imp_token_meter. Raw
+joules and token counts only - the efficiency maths runs on the AWS side.
+
 Read-only. Outbound HTTPS only. (local mode: stdlib only; vCenter/Kubernetes
 modes add pyvmomi / kubernetes.)
 
@@ -40,6 +45,9 @@ Config (environment variables, or the matching --flags):
     AAREKA_DEPT_MAP     JSON {workload_or_vm_name: department}        (optional tags)
     AAREKA_GPU_MODE     "vgpu" (default) or "mig" - label for read partitions
     AAREKA_VGPU_QFILE   path to a saved `nvidia-smi vgpu -q` dump (testing/injection)
+    AAREKA_METRICS_URL  inference server /metrics to meter tokens from (optional),
+                        "<url>[|model=<label>][|gpus=<i,j>]", several joined by ";"
+    AAREKA_TOKEN_POLL   seconds between token-counter reads (default 5)
     AAREKA_PROM_URL / AAREKA_BMC / AAREKA_IPMI / AAREKA_PDU          (telemetry endpoints)
   vCenter mode (AAREKA_SOURCE=vcenter):
     AAREKA_VCENTER            vCenter host/IP                         (required)
@@ -75,8 +83,9 @@ import urllib.request
 from datetime import datetime, timezone
 
 import imp_server_power_source as sps
+import imp_token_meter as itm
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 
 def _iso_now() -> str:
@@ -473,7 +482,7 @@ def collect_batches(cfg: dict) -> list:
     return [batch]
 
 
-def run_once(cfg: dict) -> bool:
+def run_once(cfg: dict, meter: "itm.InferenceMeter | None" = None) -> bool:
     try:
         batches = collect_batches(cfg)
     except Exception as e:
@@ -482,6 +491,14 @@ def run_once(cfg: dict) -> bool:
     if not batches:
         print("  nothing to send this cycle")
         return False
+    if meter is not None:
+        inf = meter.snapshot(cfg["dept_map"])
+        batches[0]["inference"] = inf
+        for ep in inf["endpoints"]:
+            toks = sum(m["output_tokens"] for m in ep["models"])
+            note = f"  ({ep['error']})" if ep["error"] else ""
+            print(f"  tokens: {ep['server'] or ep['url']}  {toks} output tokens in "
+                  f"{inf['window_s']:.0f}s{note}")
     ok_any = False
     for batch in batches:
         host = batch.get("host", "?")
@@ -547,6 +564,9 @@ def load_cfg(args) -> dict:
         # fleet mode
         "inventory": os.environ.get("AAREKA_INVENTORY"),
         "host_dept_map": host_dept_map,
+        # inference token metering (optional)
+        "metrics": os.environ.get("AAREKA_METRICS_URL"),
+        "token_poll": float(os.environ.get("AAREKA_TOKEN_POLL", "5")),
     }
 
 
@@ -562,16 +582,37 @@ def main():
     cfg = load_cfg(args)
     where = cfg["host"] if cfg["source"] == "local" else cfg["source"]
     print(f"\n  Aareka sender  ->  {cfg['url']}   source={cfg['source']} ({where})")
-    if args.once:
-        run_once(cfg)
-        return
-    print(f"  sending every {cfg['interval']}s. Ctrl+C to stop.\n")
+    meter = None
+    if cfg["metrics"] and cfg["source"] == "local":
+        meter = itm.InferenceMeter(itm.parse_endpoints(cfg["metrics"]),
+                                   poll_s=cfg["token_poll"])
+        try:
+            meter.start()
+        except RuntimeError as e:
+            print(f"  token metering off: {e}")
+            meter = None
+        else:
+            # the first send needs a measured window, so wait one interval first
+            print(f"  metering tokens from {cfg['metrics']}; first send in "
+                  f"{cfg['interval']}s")
     try:
+        if args.once:
+            if meter is not None:
+                time.sleep(cfg["interval"])
+            run_once(cfg, meter)
+            return
+        print(f"  sending every {cfg['interval']}s. Ctrl+C to stop.\n")
         while True:
-            run_once(cfg)
-            time.sleep(cfg["interval"])
+            if meter is not None:
+                time.sleep(cfg["interval"])
+            run_once(cfg, meter)
+            if meter is None:
+                time.sleep(cfg["interval"])
     except KeyboardInterrupt:
         print("\n  stopped.\n")
+    finally:
+        if meter is not None:
+            meter.stop()
 
 
 if __name__ == "__main__":

@@ -69,6 +69,23 @@ shows your own space's data.
 python aareka_sender.py            # Ctrl+C to stop
 ```
 
+**Energy per token for your inference servers (optional).** Point the collector at your
+inference server's Prometheus `/metrics` page (vLLM, SGLang, TGI, or llama.cpp started
+with `--metrics`). Between sends it integrates GPU power every 0.5 s into joules and reads
+the tokens the server produced in the same window; your dashboard then shows joules per
+token, tokens per joule and cost per million tokens, per model and per department.
+```bash
+# <metrics url>[|model=<label>][|gpus=<i,j>]; several servers joined by ";"
+export AAREKA_METRICS_URL="http://127.0.0.1:8000/metrics|gpus=0"
+# llama.cpp's counters carry no model name, so label it:
+# export AAREKA_METRICS_URL="http://127.0.0.1:8080/metrics|model=llama3.2-3b|gpus=0"
+python aareka_sender.py            # the first send waits one interval to measure a window
+```
+The collector only measures and sends raw joules and token counts (`imp_token_meter.py`);
+it never runs or touches your models. GPU energy (plus CPU on Linux where RAPL is
+readable) is measured; memory, fans, power-supply losses and cooling are not, so every
+per-token figure is a lower bound.
+
 **No GPU handy?** You can exercise the vGPU/MIG path from a saved dump:
 ```bash
 export AAREKA_VGPU_QFILE=/path/to/nvidia-smi-vgpu-q.txt
