@@ -1,24 +1,29 @@
 # Aareka - A Product of AICON Transformation Solutions
 
-**Measure and Monitor the Watts Per Token - The trusted energy ledger for private and hybrid AI datacenters.**
+## Measure and monitor watts per token with Aareka, the trusted energy ledger for private and hybrid AI datacenters.
 
-**Energy per token, measured.** Point Aareka at the models you already serve and it
-tells you how many joules each output token costs, per model and per team. On one laptop
-GPU running the same model, that ranged from 0.40 J to about 2.9 J per token, a 7x gap
-caused only by how requests were served. Nobody sees that gap without metering it.
+**Energy per token, measured.** Point Aareka at the models you already serve, and it
+tells you how much energy each output token costs, broken down by model and by team. In
+our own test, the same model on the same laptop GPU used anywhere from 0.40 joules to
+about 2.9 joules per token. That sevenfold gap came entirely from how the requests were
+served, and it stays invisible until you measure it.
 
-Aareka reconciles the physical power your servers draw — GPU, CPU, and whole-box —
-into a confidence-scored figure for energy consumed over a reporting interval, and
-attributes it to the workloads, applications, and business units responsible. It
-accounts for IT load first; facility overhead and cooling (PUE) are separate
-allocation layers, not implied by these figures. Every number is tagged **measured or
-estimated** and carries an explicit confidence. It runs on the heterogeneous estates
-that Kubernetes-native cost tools can't read: bare metal, VMware, mixed vendors, and
-incomplete telemetry.
+Aareka measures the power your servers draw, covering the GPU, the CPU and the whole
+machine. It turns those readings into a single, confidence-scored figure for the energy
+used over a reporting period. It then assigns that energy to the workloads, applications
+and business units responsible for it.
 
-It is **read-only**. It never touches production. It tells you what is actually
-happening, and — where a constraint appears — what you could do about it. It never
-does it for you.
+Aareka counts IT load first. Facility overhead and cooling (PUE) are added as separate
+layers and are never folded into these figures. Every number is labelled as **measured
+or estimated**, and each one carries an explicit confidence score.
+
+Aareka works across mixed estates that Kubernetes-only cost tools cannot read, including
+bare metal, VMware, hardware from different vendors, and servers with incomplete
+telemetry.
+
+Aareka is **read-only** and never touches production. It shows you what is actually
+happening and, where it finds a constraint, suggests what you could do about it. It never
+takes that action for you.
 
 ---
 
